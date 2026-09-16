@@ -94,7 +94,7 @@ use text_components::{
 use text_components::{content::Resolvable, custom::CustomData};
 
 use crate::behavior::{
-    BlockStateBehaviorExt as _, ITEM_BEHAVIORS, InteractionResult, ItemBehavior,
+    BlockStateBehaviorExt as _, FinishUseResult, ITEM_BEHAVIORS, InteractionResult, ItemBehavior,
     apply_use_remainder,
 };
 use crate::chunk::chunk_request::{ChunkRequestHandle, ChunkRequestState};
@@ -415,15 +415,21 @@ impl Player {
         let apply_side_effects =
             behavior.release_using(&mut item, &world, self, active.remaining_ticks());
         let use_on_release = behavior.use_on_release(&item);
+        let mut replacement = None;
         if apply_side_effects {
-            item = apply_use_remainder(&stack_before_using, item, self);
+            let result = apply_use_remainder(&stack_before_using, item.clone(), self);
+            if result != item {
+                replacement = Some(result);
+            }
             self.apply_item_use_cooldown(&stack_before_using);
         }
         {
             let mut inventory = self.inventory.lock();
             let current_hand = inventory.get_item_in_hand_mut(hand);
-            if *current_hand == original_hand {
-                *current_hand = item;
+            match replacement {
+                Some(result) => *current_hand = result,
+                None if *current_hand == original_hand => *current_hand = item,
+                None => {}
             }
         }
         // we re-read active here since behavior.release_using might have already ended the use
@@ -485,10 +491,15 @@ impl Player {
             let pre_finish = self.inventory.lock().get_item_in_hand(hand).clone();
             if item == pre_finish {
                 let stack_before_finish = item.clone();
-                let result = behavior.finish_using(&mut item, &world, self);
+                let outcome = behavior.finish_using(&mut item, &world, self);
                 self.apply_item_use_cooldown(&stack_before_finish);
                 let mut inventory = self.inventory.lock();
-                *inventory.get_item_in_hand_mut(hand) = result;
+                let current_hand = inventory.get_item_in_hand_mut(hand);
+                match outcome {
+                    FinishUseResult::Replaced(result) => *current_hand = result,
+                    FinishUseResult::InPlace if *current_hand == pre_finish => *current_hand = item,
+                    FinishUseResult::InPlace => {}
+                }
                 drop(inventory);
                 self.stop_using_item();
             } else {

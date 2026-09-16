@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::behavior::{InteractionResult, ItemBehavior, init_behaviors};
+use crate::behavior::{FinishUseResult, InteractionResult, ItemBehavior, init_behaviors};
 use crate::chunk_saver::PersistentEntity;
 use crate::entity::{
     ActiveItemUseState, DEFAULT_MAX_AIR_SUPPLY, Entity, EntitySyncedData, LivingEntity,
@@ -1731,9 +1731,25 @@ impl ItemBehavior for TamperOnFinish {
         _stack: &mut ItemStack,
         _world: &Arc<World>,
         user: &dyn LivingEntity,
-    ) -> ItemStack {
+    ) -> FinishUseResult {
         tamper_hand(user);
-        ItemStack::new(&vanilla_items::GLASS_BOTTLE)
+        FinishUseResult::Replaced(ItemStack::new(&vanilla_items::GLASS_BOTTLE))
+    }
+}
+
+/// Swaps the hand to DIAMOND during `finish_using` and keeps the used stack as the result.
+struct TamperOnFinishInPlace;
+
+impl ItemBehavior for TamperOnFinishInPlace {
+    fn finish_using(
+        &self,
+        stack: &mut ItemStack,
+        _world: &Arc<World>,
+        user: &dyn LivingEntity,
+    ) -> FinishUseResult {
+        stack.shrink(1);
+        tamper_hand(user);
+        FinishUseResult::InPlace
     }
 }
 
@@ -1766,6 +1782,24 @@ impl ItemBehavior for TamperOnRelease {
     ) -> bool {
         tamper_hand(user);
         false
+    }
+}
+
+/// Uses up the whole stack and swaps the hand to DIAMOND during `release_using`,
+/// then asks for after-use side effects.
+struct ConsumeAndTamperOnRelease;
+
+impl ItemBehavior for ConsumeAndTamperOnRelease {
+    fn release_using(
+        &self,
+        stack: &mut ItemStack,
+        _world: &Arc<World>,
+        user: &dyn LivingEntity,
+        _time_left: i32,
+    ) -> bool {
+        stack.shrink(stack.count());
+        tamper_hand(user);
+        true
     }
 }
 
@@ -1896,6 +1930,23 @@ fn tick_active_item_use_finish_clobbers_behavior_hand_swap() {
     assert_use_finished(&player);
 }
 
+// Vanilla `completeUsingItem` skips `setItemInHand` when `finishUsingItem`
+// returns `useItem` itself, so a hand swap made during finish survives.
+#[test]
+fn tick_active_item_use_finish_in_place_keeps_behavior_hand_swap() {
+    let world = fresh_test_world("tick_finish_in_place_tamper");
+    let player = test_player(Arc::clone(&world));
+    let active = start_using_fixture_item(&player, &vanilla_items::BOWL, 2, 1);
+
+    player.tick_active_item_use_with_behavior(&TamperOnFinishInPlace, active);
+
+    assert!(
+        hand_stack(&player).is(&vanilla_items::DIAMOND),
+        "an in-place finish must not overwrite a hand the behavior swapped"
+    );
+    assert_use_finished(&player);
+}
+
 // Cookie: eating one cookie out of a stack of three must finish the use
 // and leave two in hand.
 #[test]
@@ -1942,6 +1993,22 @@ fn release_using_item_does_not_overwrite_tampered_hand() {
     assert!(
         hand_stack(&player).is(&vanilla_items::DIAMOND),
         "release_using tampered with the hand; the stale clone must not overwrite it"
+    );
+}
+
+// Vanilla `ItemStack.releaseUsing` writes a use remainder via `setItemInHand`
+// without re-checking the hand, so it replaces a hand the behavior swapped.
+#[test]
+fn release_using_item_remainder_overwrites_tampered_hand() {
+    let world = fresh_test_world("release_remainder_tamper");
+    let player = test_player(Arc::clone(&world));
+    let active = start_using_fixture_item(&player, &vanilla_items::HONEY_BOTTLE, 1, 1);
+
+    player.release_using_item_with_behavior(&ConsumeAndTamperOnRelease, active);
+
+    assert!(
+        hand_stack(&player).is(&vanilla_items::GLASS_BOTTLE),
+        "the use remainder must replace the hand even when release_using swapped it"
     );
 }
 
