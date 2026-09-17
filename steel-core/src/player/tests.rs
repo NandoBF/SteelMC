@@ -1803,6 +1803,74 @@ impl ItemBehavior for ConsumeAndTamperOnRelease {
     }
 }
 
+/// Cancels the main-hand use and starts a new use session on the offhand during `on_use_tick`.
+struct SwitchToOffhandOnUseTick;
+
+impl ItemBehavior for SwitchToOffhandOnUseTick {
+    fn on_use_tick(
+        &self,
+        _world: &Arc<World>,
+        user: &dyn LivingEntity,
+        _stack: &mut ItemStack,
+        _ticks_remaining: i32,
+    ) {
+        let Some(player) = user.as_player() else {
+            return;
+        };
+        player.release_using_item();
+        player.start_using_item(InteractionHand::OffHand);
+    }
+}
+
+/// Shrinks the working copy and reinstalls the hand during `on_use_tick`.
+struct ShrinkAndInstallEqualHandOnUseTick;
+
+impl ItemBehavior for ShrinkAndInstallEqualHandOnUseTick {
+    fn on_use_tick(
+        &self,
+        _world: &Arc<World>,
+        user: &dyn LivingEntity,
+        stack: &mut ItemStack,
+        _ticks_remaining: i32,
+    ) {
+        install_equal_hand(user);
+        stack.shrink(1);
+    }
+}
+
+/// Shrinks the working copy and reinstalls the hand during `finish_using`.
+struct ShrinkAndInstallEqualHandOnFinish;
+
+impl ItemBehavior for ShrinkAndInstallEqualHandOnFinish {
+    fn finish_using(
+        &self,
+        stack: &mut ItemStack,
+        _world: &Arc<World>,
+        user: &dyn LivingEntity,
+    ) -> FinishUseResult {
+        install_equal_hand(user);
+        stack.shrink(1);
+        FinishUseResult::InPlace
+    }
+}
+
+/// Shrinks the working copy and reinstalls the hand during `release_using`.
+struct ShrinkAndInstallEqualHandOnRelease;
+
+impl ItemBehavior for ShrinkAndInstallEqualHandOnRelease {
+    fn release_using(
+        &self,
+        stack: &mut ItemStack,
+        _world: &Arc<World>,
+        user: &dyn LivingEntity,
+        _time_left: i32,
+    ) -> bool {
+        install_equal_hand(user);
+        stack.shrink(1);
+        false
+    }
+}
+
 fn tamper_hand(user: &dyn LivingEntity) {
     let Some(player) = user.as_player() else {
         return;
@@ -1813,6 +1881,17 @@ fn tamper_hand(user: &dyn LivingEntity) {
     );
 }
 
+fn install_equal_hand(user: &dyn LivingEntity) {
+    let Some(player) = user.as_player() else {
+        return;
+    };
+    let mut inventory = player.inventory.lock();
+    let stack = inventory
+        .get_item_in_hand(InteractionHand::MainHand)
+        .clone();
+    inventory.set_item_in_hand(InteractionHand::MainHand, stack);
+}
+
 // Covers a vanilla-accurate branch that no vanilla item can replicate: a
 // behavior shrinks the hand stack during `on_use_tick` without stopping the use.
 #[test]
@@ -1821,6 +1900,7 @@ fn tick_active_item_use_writes_back_shrunk_stack() {
     let player = test_player(Arc::clone(&world));
     let active = start_using_fixture_item(&player, &vanilla_items::STICK, 1, 2);
     let original_count = hand_stack(&player).count();
+    let changed_before = player.inventory.lock().get_times_changed();
 
     player.tick_active_item_use_with_behavior(&ShrinkOnUseTick, active);
 
@@ -1828,6 +1908,11 @@ fn tick_active_item_use_writes_back_shrunk_stack() {
         hand_stack(&player).count(),
         original_count - 1,
         "on_use_tick shrunk the clone; the write-back should persist that change"
+    );
+    assert_eq!(
+        player.inventory.lock().get_times_changed() - changed_before,
+        1,
+        "the write-back must record the shrink through set_changed"
     );
 }
 
@@ -1897,6 +1982,58 @@ fn tick_active_item_use_preserves_mutations_on_early_stop() {
     assert_use_finished(&player);
 }
 
+// No vanilla item can cancel its own use and start an offhand use from `on_use_tick`,
+// The resulting offhand session must survive the main-hand tick.
+#[test]
+fn tick_active_item_use_preserves_offhand_session_started_by_behavior() {
+    init_vanilla_registry();
+    init_behaviors();
+
+    let world = fresh_test_world("tick_switch_offhand");
+    let player = test_player(Arc::clone(&world));
+    player
+        .inventory
+        .lock()
+        .set_offhand_item(ItemStack::new(&vanilla_items::COOKIE));
+    let active = start_using_fixture_item(&player, &vanilla_items::STICK, 1, 1);
+
+    player.tick_active_item_use_with_behavior(&SwitchToOffhandOnUseTick, active);
+
+    assert_eq!(
+        player.active_item_use_hand(),
+        Some(InteractionHand::OffHand),
+        "the offhand session started by on_use_tick must survive the main-hand tick"
+    );
+    assert!(
+        using_item_flag(&player),
+        "USING_ITEM_FLAG must track the offhand session"
+    );
+}
+
+// An equal-valued rewrite of the hand must still stop the stale-clone write-back,
+// so a replacement that merely equals the original is not overwritten by the shrunk copy.
+#[test]
+fn tick_active_item_use_preserves_equal_valued_hand_replacement() {
+    init_vanilla_registry();
+    init_behaviors();
+
+    let world = fresh_test_world("tick_equal_reinstall");
+    let player = test_player(Arc::clone(&world));
+    let active = start_using_fixture_item(&player, &vanilla_items::BOWL, 2, 2);
+
+    player.tick_active_item_use_with_behavior(&ShrinkAndInstallEqualHandOnUseTick, active);
+
+    assert_eq!(
+        hand_stack(&player).count(),
+        2,
+        "the hand was reinstalled with an equal-valued stack; the shrunk clone must not be written back"
+    );
+    assert!(
+        player.active_item_use_hand().is_some(),
+        "use must continue while ticks remain"
+    );
+}
+
 // Honey bottle: drinking a single bottle must finish the use and replace
 // the hand stack with the glass bottle remainder.
 #[test]
@@ -1947,6 +2084,26 @@ fn tick_active_item_use_finish_in_place_keeps_behavior_hand_swap() {
     assert_use_finished(&player);
 }
 
+// A reinstall equal to `pre_finish` must not be overwritten by the shrunk result.
+#[test]
+fn tick_active_item_use_finish_preserves_equal_valued_hand_replacement() {
+    init_vanilla_registry();
+    init_behaviors();
+
+    let world = fresh_test_world("tick_finish_equal_reinstall");
+    let player = test_player(Arc::clone(&world));
+    let active = start_using_fixture_item(&player, &vanilla_items::BOWL, 2, 1);
+
+    player.tick_active_item_use_with_behavior(&ShrinkAndInstallEqualHandOnFinish, active);
+
+    assert_eq!(
+        hand_stack(&player).count(),
+        2,
+        "an in-place finish reinstall equal to pre_finish must not be overwritten by the shrunk result"
+    );
+    assert_use_finished(&player);
+}
+
 // Cookie: eating one cookie out of a stack of three must finish the use
 // and leave two in hand.
 #[test]
@@ -1954,6 +2111,7 @@ fn tick_active_item_use_eating_cookie_decrements_the_stack() {
     let world = fresh_test_world("tick_finish_cookie");
     let player = player_using_test_item(Arc::clone(&world), &vanilla_items::COOKIE, 3);
     let original_count = hand_stack(&player).count();
+    let changed_before = player.inventory.lock().get_times_changed();
 
     tick_until_use_finished(&player);
 
@@ -1961,6 +2119,11 @@ fn tick_active_item_use_eating_cookie_decrements_the_stack() {
         hand_stack(&player).count(),
         original_count - 1,
         "eating a cookie should shrink the stack by one"
+    );
+    assert_eq!(
+        player.inventory.lock().get_times_changed() - changed_before,
+        1,
+        "eating must record exactly one inventory change"
     );
 }
 
@@ -1972,6 +2135,7 @@ fn release_using_item_writes_back_shrunk_stack() {
     let player = test_player(Arc::clone(&world));
     let active = start_using_fixture_item(&player, &vanilla_items::FLINT, 1, 1);
     let original_count = hand_stack(&player).count();
+    let changed_before = player.inventory.lock().get_times_changed();
 
     player.release_using_item_with_behavior(&ShrinkOnRelease, active);
 
@@ -1979,6 +2143,11 @@ fn release_using_item_writes_back_shrunk_stack() {
         hand_stack(&player).count(),
         original_count - 1,
         "release_using shrunk the clone; the write-back should persist that change"
+    );
+    assert_eq!(
+        player.inventory.lock().get_times_changed() - changed_before,
+        1,
+        "the release write-back must record the shrink through set_changed"
     );
 }
 
@@ -2010,6 +2179,26 @@ fn release_using_item_remainder_overwrites_tampered_hand() {
         hand_stack(&player).is(&vanilla_items::GLASS_BOTTLE),
         "the use remainder must replace the hand even when release_using swapped it"
     );
+}
+
+// A reinstall that merely equals the original hand must not be overwritten by the shrunk working copy.
+#[test]
+fn release_using_item_preserves_equal_valued_hand_replacement() {
+    init_vanilla_registry();
+    init_behaviors();
+
+    let world = fresh_test_world("release_equal_reinstall");
+    let player = test_player(Arc::clone(&world));
+    let active = start_using_fixture_item(&player, &vanilla_items::BOWL, 2, 1);
+
+    player.release_using_item_with_behavior(&ShrinkAndInstallEqualHandOnRelease, active);
+
+    assert_eq!(
+        hand_stack(&player).count(),
+        2,
+        "a release reinstall equal to the original must not be overwritten by the shrunk stack"
+    );
+    assert_use_finished(&player);
 }
 
 #[test]

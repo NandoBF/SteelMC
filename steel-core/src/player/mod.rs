@@ -347,6 +347,10 @@ impl Player {
             .map(|active| active.hand())
     }
 
+    fn hand_write_generation(&self, hand: InteractionHand) -> u32 {
+        self.inventory.lock().hand_write_generation(hand)
+    }
+
     /// Starts using the item currently held in `hand`.
     pub fn start_using_item(&self, hand: InteractionHand) {
         let item = {
@@ -412,8 +416,10 @@ impl Player {
         };
         let stack_before_using = item.clone();
         let world = self.get_world();
+        let writes_before = self.hand_write_generation(hand);
         let apply_side_effects =
             behavior.release_using(&mut item, &world, self, active.remaining_ticks());
+        let hand_was_written = self.hand_write_generation(hand) != writes_before;
         let use_on_release = behavior.use_on_release(&item);
         let mut replacement = None;
         if apply_side_effects {
@@ -425,10 +431,11 @@ impl Player {
         }
         {
             let mut inventory = self.inventory.lock();
-            let current_hand = inventory.get_item_in_hand_mut(hand);
             match replacement {
-                Some(result) => *current_hand = result,
-                None if *current_hand == original_hand => *current_hand = item,
+                Some(result) => inventory.set_item_in_hand(hand, result),
+                None if !hand_was_written && inventory.get_item_in_hand(hand) == &original_hand => {
+                    inventory.mutate_item_in_hand(hand, |current| *current = item.clone());
+                }
                 None => {}
             }
         }
@@ -467,18 +474,21 @@ impl Player {
         };
 
         let world = self.get_world();
+        let writes_before = self.hand_write_generation(hand);
         behavior.on_use_tick(&world, self, &mut item, active.remaining_ticks());
+        let hand_was_written = self.hand_write_generation(hand) != writes_before;
 
-        {
-            let mut inventory = self.inventory.lock();
-            let current_stack = inventory.get_item_in_hand_mut(hand);
-            if *current_stack == original_stack {
-                *current_stack = item.clone();
+        self.inventory.lock().mutate_item_in_hand(hand, |current| {
+            if !hand_was_written && *current == original_stack {
+                *current = item.clone();
             }
-        }
+        });
 
-        if self.active_item_use_hand() != Some(hand) {
-            self.stop_using_item(); // can't guarantee the item clears the flag
+        let Some(active) = self.living_base.active_item_use() else {
+            self.stop_using_item();
+            return;
+        };
+        if active.hand() != hand {
             return;
         }
 
@@ -491,13 +501,19 @@ impl Player {
             let pre_finish = self.inventory.lock().get_item_in_hand(hand).clone();
             if item == pre_finish {
                 let stack_before_finish = item.clone();
+                let writes_before = self.hand_write_generation(hand);
                 let outcome = behavior.finish_using(&mut item, &world, self);
                 self.apply_item_use_cooldown(&stack_before_finish);
+                let hand_was_written = self.hand_write_generation(hand) != writes_before;
+
                 let mut inventory = self.inventory.lock();
-                let current_hand = inventory.get_item_in_hand_mut(hand);
                 match outcome {
-                    FinishUseResult::Replaced(result) => *current_hand = result,
-                    FinishUseResult::InPlace if *current_hand == pre_finish => *current_hand = item,
+                    FinishUseResult::Replaced(result) => inventory.set_item_in_hand(hand, result),
+                    FinishUseResult::InPlace
+                        if !hand_was_written && inventory.get_item_in_hand(hand) == &pre_finish =>
+                    {
+                        inventory.mutate_item_in_hand(hand, |current| *current = item.clone());
+                    }
                     FinishUseResult::InPlace => {}
                 }
                 drop(inventory);
